@@ -2068,6 +2068,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 "idx",
                 "true_shape",
                 "data_norm_type",
+                "original_shape",
             ]
         )
         for view in validated_views:

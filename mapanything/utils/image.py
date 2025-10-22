@@ -319,6 +319,7 @@ def load_images(
             dict(
                 img=ImgNorm(img)[None],
                 true_shape=np.int32([img.size[::-1]]),
+                original_shape=np.int32([[H1, W1]]),
                 idx=len(imgs),
                 instance=str(len(imgs)),
                 data_norm_type=[norm_type],

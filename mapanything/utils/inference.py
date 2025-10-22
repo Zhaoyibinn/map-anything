@@ -34,6 +34,7 @@ ALLOWED_VIEW_KEYS = {
     "camera_poses",  # Optional - camera poses
     "is_metric_scale",  # Optional - whether inputs are metric scale
     "true_shape",  # Optional - original image shape
+    "original_shape",  # Optional - pre-resize image shape metadata
     "idx",  # Optional - index of the view
     "instance",  # Optional - instance info of the view
 }
@@ -85,6 +86,7 @@ def loss_of_one_batch_multi_view(
                 "instance",
                 "idx",
                 "true_shape",
+                "original_shape",
                 "rng",
                 "data_norm_type",
             ]
