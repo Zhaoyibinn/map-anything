@@ -28,7 +28,7 @@ REPLICA_ROOT = Path("Replica")
 REPLICA_GT_ROOT = REPLICA_ROOT / "replica_gt"
 SCENE_NAME = "office0_sparse"
 input_camera = True
-input_pose = False
+input_pose = True
 input_depth = True
 
 input_tags: List[str] = []
@@ -43,10 +43,10 @@ input_suffix = "+".join(input_tags) if input_tags else "no_inputs"
 output_root = Path("output") / "Replica" / SCENE_NAME / input_suffix
 
 
-DEPTH_SCALE_MM = 1.5
+DEPTH_SCALE_MM = 5.0
 SCALE_TRANS = False
 
-MANUAL_DEPTH_SCALE = False
+MANUAL_DEPTH_SCALE = True
 
 
 
@@ -443,6 +443,7 @@ per_view_outputs: List[dict] = []
 camera_entries: List[dict] = []
 image_entries: List[dict] = []
 depth_scale_stats: List[float] = []
+apply_pose_scale = not input_pose
 
 # Access results for each view - Complete list of metric outputs
 for i, pred in enumerate(predictions):
@@ -551,11 +552,7 @@ for i, pred in enumerate(predictions):
 
             x_cam = (xs_valid - cx) * depth_valid / max(fx, 1e-8)
             y_cam = (ys_valid - cy) * depth_valid / max(fy, 1e-8)
-            points_cam = np.stack((x_cam, y_cam, depth_valid), axis=-1)
-
-            R_wc = pose_cam2world[:3, :3].astype(np.float32)
-            t_wc = pose_cam2world[:3, 3].astype(np.float32)
-            valid_points_world = points_cam @ R_wc.T + t_wc
+            points_cam_valid = np.stack((x_cam, y_cam, depth_valid), axis=-1)
 
             if image_view is not None:
                 image_view_np = np.clip(image_view, 0.0, 1.0).astype(np.float32)
@@ -563,14 +560,14 @@ for i, pred in enumerate(predictions):
                     valid_mask_points.reshape(-1)
                 ]
             else:
-                valid_colors = np.zeros((valid_points_world.shape[0], 3), dtype=np.float32)
+                valid_colors = np.zeros((points_cam_valid.shape[0], 3), dtype=np.float32)
         else:
-            valid_points_world = np.empty((0, 3), dtype=np.float32)
+            points_cam_valid = np.empty((0, 3), dtype=np.float32)
             valid_colors = np.empty((0, 3), dtype=np.float32)
 
         depth_map_pc = np.nan_to_num(depth_map_pc, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if input_depth and view_idx < len(views) and MANUAL_DEPTH_SCALE:
+        if apply_pose_scale and view_idx < len(views):
             gt_depth_tensor = views[view_idx].get("depth_z")
             if gt_depth_tensor is not None:
                 gt_depth_np = np.squeeze(to_numpy(gt_depth_tensor)).astype(np.float32)
@@ -587,9 +584,6 @@ for i, pred in enumerate(predictions):
                     if denominator > 1e-8:
                         scale_factor = numerator / denominator
                         depth_scale_stats.append(scale_factor)
-                        # print(
-                        #     f"Depth scale view {view_idx:03d}: {scale_factor:.6f}"
-                        # )
 
         depth_mm = np.clip(
             depth_map_pc * DEPTH_SCALE_MM,
@@ -696,7 +690,7 @@ for i, pred in enumerate(predictions):
         per_view_outputs.append(
             dict(
                 view_dir=view_dir,
-                points=valid_points_world.astype(np.float32),
+                points_cam=points_cam_valid.astype(np.float32),
                 colors=valid_colors.astype(np.float32),
                 pose_cam2world=pose_cam2world,
                 image_id=image_id,
@@ -709,13 +703,14 @@ for i, pred in enumerate(predictions):
         saved_view_idx += 1
 
 
-if depth_scale_stats and MANUAL_DEPTH_SCALE:
+if apply_pose_scale and depth_scale_stats:
     depth_scale_stats_np = np.array(depth_scale_stats, dtype=np.float32)
-    median_scale = float(np.median(depth_scale_stats_np))
+    scale_to_apply = float(np.median(depth_scale_stats_np))
 else:
-    median_scale = 1.0
-scale_to_apply = median_scale
-print(f"Applying mannual depth scale factor: {scale_to_apply:.6f}")
+    scale_to_apply = 1.0
+
+if apply_pose_scale:
+    print(f"Applying depth-to-pose scale factor: {scale_to_apply:.6f}")
 
 image_entries = []
 all_points_scaled: List[np.ndarray] = []
@@ -723,16 +718,20 @@ all_colors_list: List[np.ndarray] = []
 
 for data in per_view_outputs:
     view_dir = data["view_dir"]
-    points = data["points"]
+    points_cam = data["points_cam"]
     colors = data["colors"]
     pose_cam2world = data["pose_cam2world"].copy()
 
-    scaled_points = points * scale_to_apply
     scaled_pose = pose_cam2world
-    scaled_pose[:3, 3] *= scale_to_apply
+    if apply_pose_scale:
+        scaled_pose[:3, 3] *= scale_to_apply
+
+    R_wc = scaled_pose[:3, :3]
+    t_wc = scaled_pose[:3, 3]
+    points_world = points_cam @ R_wc.T + t_wc
 
     point_cloud = o3d.geometry.PointCloud()
-    point_cloud.points = o3d.utility.Vector3dVector(scaled_points.astype(np.float64))
+    point_cloud.points = o3d.utility.Vector3dVector(points_world.astype(np.float64))
     point_cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
     o3d.io.write_point_cloud(str(view_dir / "points.ply"), point_cloud)
 
@@ -743,8 +742,6 @@ for data in per_view_outputs:
         header="Camera pose (4x4 cam2world)",
     )
 
-    R_wc = scaled_pose[:3, :3]
-    t_wc = scaled_pose[:3, 3]
     R_cw = R_wc.T
     t_cw = -R_cw @ t_wc
     qvec = rotation_matrix_to_qvec(R_cw)
@@ -759,7 +756,7 @@ for data in per_view_outputs:
         )
     )
 
-    all_points_scaled.append(scaled_points.astype(np.float32))
+    all_points_scaled.append(points_world.astype(np.float32))
     all_colors_list.append(colors.astype(np.float32))
 
 if all_points_scaled:
