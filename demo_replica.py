@@ -29,7 +29,7 @@ REPLICA_GT_ROOT = REPLICA_ROOT / "replica_gt"
 SCENE_NAME = "office0_sparse"
 input_camera = True
 input_pose = False
-input_depth = False
+input_depth = True
 
 input_tags: List[str] = []
 if input_camera:
@@ -41,6 +41,12 @@ if input_depth:
 input_suffix = "+".join(input_tags) if input_tags else "no_inputs"
 
 output_root = Path("output") / "Replica" / SCENE_NAME / input_suffix
+
+
+DEPTH_SCALE_MM = 1.5
+SCALE_TRANS = False
+
+MANUAL_DEPTH_SCALE = False
 
 
 
@@ -366,13 +372,14 @@ for idx, view in enumerate(views):
             ]
 
         depth_cropped = np.ascontiguousarray(depth_cropped.astype(np.float32))
-        depth_tensor = torch.from_numpy(depth_cropped).unsqueeze(0)
+        depth_cropped_mm = depth_cropped * DEPTH_SCALE_MM / 6553.5
+        depth_tensor_mm = torch.from_numpy(depth_cropped_mm).unsqueeze(0)
         if input_depth:
-            view["depth_z"] = depth_tensor / 6553.5
-            view["is_metric_scale"] = torch.tensor([True], dtype=torch.bool)
-        # view["gt_depth_resized"] = depth_tensor.unsqueeze(-1)
-        gt_depths_resized.append(depth_cropped.copy())
-        gt_depths_raw.append(np.ascontiguousarray(depth_raw))
+            view["depth_z"] = depth_tensor_mm
+            # view["is_metric_scale"] = torch.tensor([True], dtype=torch.bool)
+
+        gt_depths_resized.append(depth_cropped_mm.copy())
+        gt_depths_raw.append(np.ascontiguousarray(depth_raw_float * DEPTH_SCALE_MM))
         gt_depth_paths.append(depth_path)
     else:
         missing_depth_images.append(image_name)
@@ -388,7 +395,7 @@ for idx, view in enumerate(views):
 
     gt_pose_cam2world = np.eye(4, dtype=np.float32)
     gt_pose_cam2world[:3, :3] = gt_R_wc.astype(np.float32)
-    gt_pose_cam2world[:3, 3] = gt_t_wc.astype(np.float32)
+    gt_pose_cam2world[:3, 3] = (gt_t_wc * DEPTH_SCALE_MM).astype(np.float32)
 
     if input_pose:
         view["camera_poses"] = torch.from_numpy(gt_pose_cam2world[None, ...])
@@ -424,8 +431,6 @@ align_sparse_dir.mkdir(parents=True, exist_ok=True)
 gt_sparse_dir = sparse_root / "gt"
 gt_sparse_dir.mkdir(parents=True, exist_ok=True)
 
-DEPTH_SCALE_MM = 1000.0
-
 
 def to_numpy(value):
     if isinstance(value, torch.Tensor):
@@ -434,17 +439,17 @@ def to_numpy(value):
 
 
 saved_view_idx = 0
-all_points = []
-all_colors = []
+per_view_outputs: List[dict] = []
 camera_entries: List[dict] = []
 image_entries: List[dict] = []
+depth_scale_stats: List[float] = []
 
 # Access results for each view - Complete list of metric outputs
 for i, pred in enumerate(predictions):
     # Geometry outputs
     pts3d = pred["pts3d"]                     # 3D points in world coordinates (B, H, W, 3)
     pts3d_cam = pred["pts3d_cam"]             # 3D points in camera coordinates (B, H, W, 3)
-    depth_z = pred["depth_z"]                 # Z-depth in camera frame (B, H, W, 1)
+    depth_z_pred = pred["depth_z"]            # Z-depth in camera frame (B, H, W, 1)
     depth_along_ray = pred["depth_along_ray"] # Depth along ray in camera frame (B, H, W, 1)
 
     # Camera outputs
@@ -462,31 +467,52 @@ for i, pred in enumerate(predictions):
 
     # Scaling
     metric_scaling_factor = pred["metric_scaling_factor"]  # Applied metric scaling (B,)
+    # print("Metric scaling factor:", metric_scaling_factor)
 
     # Original input
     img_no_norm = pred["img_no_norm"]         # Denormalized input images for visualization (B, H, W, 3)
 
     # Save key outputs to disk for each view in the batch
     pts3d_np = to_numpy(pts3d)
-    depth_np = to_numpy(depth_z)
-    intrinsics_np = to_numpy(intrinsics)
-    poses_np = to_numpy(camera_poses)
+    depth_pc_tensor = depth_z_pred
+    gt_depth_tensor_for_view = views[i].get("depth_z")
+    if gt_depth_tensor_for_view is not None:
+        depth_pc_tensor = gt_depth_tensor_for_view.unsqueeze(-1)
+        print("采用GT depth生成点云")
+    depth_pc_np = to_numpy(depth_pc_tensor)
+    depth_pred_np = to_numpy(depth_z_pred)
+
+    intrinsics_source = intrinsics
+    intrinsics_input = views[i].get("intrinsics")
+    if intrinsics_input is not None:
+        intrinsics_source = intrinsics_input
+    intrinsics_np = to_numpy(intrinsics_source)
+
+    poses_source = camera_poses
+    pose_input = views[i].get("camera_poses")
+    if pose_input is not None:
+        poses_source = pose_input
+    poses_np = to_numpy(poses_source)
     mask_np = to_numpy(mask) if mask is not None else None
     img_np = to_numpy(img_no_norm) if img_no_norm is not None else None
 
-    depth_np = depth_np[..., 0]
-    mask_np = mask_np[..., 0]
+    depth_pc_np = depth_pc_np[..., 0]
+    depth_pred_np = depth_pred_np[..., 0]
+    if mask_np is not None:
+        mask_np = mask_np[..., 0]
 
     batch_size = pts3d_np.shape[0]
 
     for b in range(batch_size):
+        view_idx = saved_view_idx
         view_dir = output_root / f"view_{saved_view_idx:03d}"
         view_dir.mkdir(parents=True, exist_ok=True)
 
-        points = pts3d_np[b]
-        depth_map = np.squeeze(depth_np[b]).astype(np.float32)
+        depth_map_pc = np.squeeze(depth_pc_np[b]).astype(np.float32)
+        depth_map_pred = np.squeeze(depth_pred_np[b]).astype(np.float32)
         mask_view = mask_np[b] if mask_np is not None else None
         image_view = img_np[b] if img_np is not None else None
+        pose_cam2world = poses_np[b].astype(np.float64)
         transform = (
             view_transforms[saved_view_idx]
             if saved_view_idx < len(view_transforms)
@@ -501,29 +527,75 @@ for i, pred in enumerate(predictions):
             crop_left = 0.0
             crop_top = 0.0
 
-        points_flat = points.reshape(-1, 3).astype(np.float32)
-        valid_flat = np.isfinite(points_flat).all(axis=1)
+        intrinsics_view = intrinsics_np[b].astype(np.float32)
+        fx = float(intrinsics_view[0, 0])
+        fy = float(intrinsics_view[1, 1])
+        cx = float(intrinsics_view[0, 2])
+        cy = float(intrinsics_view[1, 2])
+
+        height, width = depth_map_pc.shape
+        ys, xs = np.meshgrid(
+            np.arange(height, dtype=np.float32),
+            np.arange(width, dtype=np.float32),
+            indexing="ij",
+        )
+
+        valid_mask_points = np.isfinite(depth_map_pc) & (depth_map_pc > 1e-8)
         if mask_view is not None:
-            valid_flat &= mask_view.reshape(-1) > 0.5
+            valid_mask_points &= mask_view > 0.5
 
-        valid_points = points_flat[valid_flat]
+        if np.any(valid_mask_points):
+            depth_valid = depth_map_pc[valid_mask_points]
+            xs_valid = xs[valid_mask_points]
+            ys_valid = ys[valid_mask_points]
 
+            x_cam = (xs_valid - cx) * depth_valid / max(fx, 1e-8)
+            y_cam = (ys_valid - cy) * depth_valid / max(fy, 1e-8)
+            points_cam = np.stack((x_cam, y_cam, depth_valid), axis=-1)
 
-        colors_flat = image_view.reshape(-1, 3)
-        colors_float = np.clip(colors_flat, 0.0, 1.0).astype(np.float32)
-        valid_colors = colors_float[valid_flat]
-        all_points.append(valid_points.astype(np.float32))
-        all_colors.append(valid_colors.astype(np.float32))
-        point_cloud = o3d.geometry.PointCloud()
-        point_cloud.points = o3d.utility.Vector3dVector(valid_points.astype(np.float64))
-        point_cloud.colors = o3d.utility.Vector3dVector(valid_colors.astype(np.float64))
-        o3d.io.write_point_cloud(str(view_dir / "points.ply"), point_cloud)
-        # 保存点云 并且加入全部点云合并列表
+            R_wc = pose_cam2world[:3, :3].astype(np.float32)
+            t_wc = pose_cam2world[:3, 3].astype(np.float32)
+            valid_points_world = points_cam @ R_wc.T + t_wc
 
+            if image_view is not None:
+                image_view_np = np.clip(image_view, 0.0, 1.0).astype(np.float32)
+                valid_colors = image_view_np.reshape(height * width, 3)[
+                    valid_mask_points.reshape(-1)
+                ]
+            else:
+                valid_colors = np.zeros((valid_points_world.shape[0], 3), dtype=np.float32)
+        else:
+            valid_points_world = np.empty((0, 3), dtype=np.float32)
+            valid_colors = np.empty((0, 3), dtype=np.float32)
 
+        depth_map_pc = np.nan_to_num(depth_map_pc, nan=0.0, posinf=0.0, neginf=0.0)
 
-        depth_map = np.nan_to_num(depth_map, nan=0.0, posinf=0.0, neginf=0.0)
-        depth_mm = np.clip(depth_map * DEPTH_SCALE_MM, 0.0, float(np.iinfo(np.uint16).max))
+        if input_depth and view_idx < len(views) and MANUAL_DEPTH_SCALE:
+            gt_depth_tensor = views[view_idx].get("depth_z")
+            if gt_depth_tensor is not None:
+                gt_depth_np = np.squeeze(to_numpy(gt_depth_tensor)).astype(np.float32)
+                pred_depth_np = depth_map_pred.copy()
+                valid_mask = np.isfinite(pred_depth_np) & (pred_depth_np > 1e-8)
+                valid_mask &= np.isfinite(gt_depth_np) & (gt_depth_np > 1e-8)
+                if mask_view is not None:
+                    valid_mask &= mask_view > 0.5
+                valid_gt = gt_depth_np[valid_mask]
+                valid_pred = pred_depth_np[valid_mask]
+                if valid_pred.size > 0:
+                    numerator = float(np.dot(valid_pred, valid_gt))
+                    denominator = float(np.dot(valid_pred, valid_pred))
+                    if denominator > 1e-8:
+                        scale_factor = numerator / denominator
+                        depth_scale_stats.append(scale_factor)
+                        # print(
+                        #     f"Depth scale view {view_idx:03d}: {scale_factor:.6f}"
+                        # )
+
+        depth_mm = np.clip(
+            depth_map_pc * DEPTH_SCALE_MM,
+            0.0,
+            float(np.iinfo(np.uint16).max),
+        )
         depth_mm = depth_mm.astype(np.uint16)
         cv2.imwrite(str(view_dir / "depth.png"), depth_mm)
         cv2.imwrite(str(view_dir / "depth.tiff"), depth_mm)
@@ -538,15 +610,20 @@ for i, pred in enumerate(predictions):
         if gt_depth_resized is not None:
             np.save(view_dir / "gt_depth.npy", gt_depth_resized.astype(np.float32))
 
-            raw_depth = (
+            raw_depth_mm = (
                 gt_depths_raw[saved_view_idx]
                 if saved_view_idx < len(gt_depths_raw)
                 else None
             )
-            if raw_depth is not None:
-                np.save(view_dir / "gt_depth_raw.npy", raw_depth)
-                if raw_depth.dtype in (np.uint8, np.uint16, np.uint32):
-                    cv2.imwrite(str(view_dir / "gt_depth_raw.png"), raw_depth)
+            if raw_depth_mm is not None:
+                raw_depth_mm = raw_depth_mm.astype(np.float32)
+                np.save(view_dir / "gt_depth_raw.npy", raw_depth_mm)
+                depth_raw_u16 = np.clip(
+                    raw_depth_mm,
+                    0.0,
+                    float(np.iinfo(np.uint16).max),
+                ).astype(np.uint16)
+                cv2.imwrite(str(view_dir / "gt_depth_raw.png"), depth_raw_u16)
 
             depth_src_path = (
                 gt_depth_paths[saved_view_idx]
@@ -560,7 +637,7 @@ for i, pred in enumerate(predictions):
 
             if gt_depth_resized.dtype in (np.float32, np.float64):
                 depth_mm_gt = np.clip(
-                    gt_depth_resized * DEPTH_SCALE_MM,
+                    gt_depth_resized,
                     0.0,
                     float(np.iinfo(np.uint16).max),
                 ).astype(np.uint16)
@@ -585,14 +662,7 @@ for i, pred in enumerate(predictions):
             fmt="%.8f",
             header="Camera intrinsics (3x3)",
         )
-        pose_cam2world = poses_np[b].astype(np.float64)
-        np.savetxt(
-            view_dir / "camera_pose.txt",
-            pose_cam2world,
-            fmt="%.8f",
-            header="Camera pose (4x4 cam2world)",
-        )
-        # 保存内参外参(单个图片)
+        # 保存相机位姿后续统一按尺度缩放
 
         camera_id = saved_view_idx + 1
         image_id = saved_view_idx + 1
@@ -602,8 +672,8 @@ for i, pred in enumerate(predictions):
             if image_view is not None:
                 orig_h, orig_w = image_view.shape[:2]
             else:
-                orig_h = depth_map.shape[0]
-                orig_w = depth_map.shape[1]
+                orig_h = depth_map_pc.shape[0]
+                orig_w = depth_map_pc.shape[1]
         image_name = (
             image_paths[saved_view_idx].name
             if saved_view_idx < len(image_paths)
@@ -623,28 +693,82 @@ for i, pred in enumerate(predictions):
         )
         # 保存内参信息到colmap格式
 
-        R_wc = pose_cam2world[:3, :3]
-        t_wc = pose_cam2world[:3, 3]
-        R_cw = R_wc.T
-        t_cw = -R_cw @ t_wc
-        qvec = rotation_matrix_to_qvec(R_cw)
-
-        image_entries.append(
+        per_view_outputs.append(
             dict(
+                view_dir=view_dir,
+                points=valid_points_world.astype(np.float32),
+                colors=valid_colors.astype(np.float32),
+                pose_cam2world=pose_cam2world,
                 image_id=image_id,
                 camera_id=camera_id,
-                name=image_name,
-                qvec=qvec,
-                tvec=t_cw.astype(np.float64),
+                image_name=image_name,
             )
         )
-        # 保存外参信息到colmap格式
+        # 保存外参信息待统一缩放后写入
 
         saved_view_idx += 1
 
 
-merged_points = np.concatenate(all_points, axis=0)
-merged_colors = np.concatenate(all_colors, axis=0)
+if depth_scale_stats and MANUAL_DEPTH_SCALE:
+    depth_scale_stats_np = np.array(depth_scale_stats, dtype=np.float32)
+    median_scale = float(np.median(depth_scale_stats_np))
+else:
+    median_scale = 1.0
+scale_to_apply = median_scale
+print(f"Applying mannual depth scale factor: {scale_to_apply:.6f}")
+
+image_entries = []
+all_points_scaled: List[np.ndarray] = []
+all_colors_list: List[np.ndarray] = []
+
+for data in per_view_outputs:
+    view_dir = data["view_dir"]
+    points = data["points"]
+    colors = data["colors"]
+    pose_cam2world = data["pose_cam2world"].copy()
+
+    scaled_points = points * scale_to_apply
+    scaled_pose = pose_cam2world
+    scaled_pose[:3, 3] *= scale_to_apply
+
+    point_cloud = o3d.geometry.PointCloud()
+    point_cloud.points = o3d.utility.Vector3dVector(scaled_points.astype(np.float64))
+    point_cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
+    o3d.io.write_point_cloud(str(view_dir / "points.ply"), point_cloud)
+
+    np.savetxt(
+        view_dir / "camera_pose.txt",
+        scaled_pose,
+        fmt="%.8f",
+        header="Camera pose (4x4 cam2world)",
+    )
+
+    R_wc = scaled_pose[:3, :3]
+    t_wc = scaled_pose[:3, 3]
+    R_cw = R_wc.T
+    t_cw = -R_cw @ t_wc
+    qvec = rotation_matrix_to_qvec(R_cw)
+
+    image_entries.append(
+        dict(
+            image_id=data["image_id"],
+            camera_id=data["camera_id"],
+            name=data["image_name"],
+            qvec=qvec,
+            tvec=t_cw.astype(np.float64),
+        )
+    )
+
+    all_points_scaled.append(scaled_points.astype(np.float32))
+    all_colors_list.append(colors.astype(np.float32))
+
+if all_points_scaled:
+    merged_points = np.concatenate(all_points_scaled, axis=0)
+    merged_colors = np.concatenate(all_colors_list, axis=0)
+else:
+    merged_points = np.empty((0, 3), dtype=np.float32)
+    merged_colors = np.empty((0, 3), dtype=np.float32)
+
 merged_pc = o3d.geometry.PointCloud()
 merged_pc.points = o3d.utility.Vector3dVector(merged_points.astype(np.float64))
 merged_pc.colors = o3d.utility.Vector3dVector(np.clip(merged_colors, 0.0, 1.0).astype(np.float64))
@@ -670,7 +794,8 @@ if GT_DENSE_PLY is not None and GT_DENSE_PLY.exists():
         gt_ply=str(GT_DENSE_PLY),
         output_dir=align_dir,
         voxel_size=0.04,
-        scale_trans = False
+        unit_scale=DEPTH_SCALE_MM,
+        scale_trans = SCALE_TRANS
     )
     print(f"Alignment scale: {scale}")
 

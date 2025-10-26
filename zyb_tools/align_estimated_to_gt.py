@@ -157,7 +157,7 @@ def load_estimated_predictions(
     return entries, np.stack(poses, axis=0), cameras
 
 
-def load_gt_cam2world(colmap_dir: Path) -> Dict[str, np.ndarray]:
+def load_gt_cam2world(colmap_dir: Path, unit_scale: float) -> Dict[str, np.ndarray]:
     images_txt = colmap_dir / "images.txt"
     if not images_txt.exists():
         raise FileNotFoundError(f"Missing COLMAP images file: {images_txt}")
@@ -171,7 +171,7 @@ def load_gt_cam2world(colmap_dir: Path) -> Dict[str, np.ndarray]:
         t_wc = -R_wc @ t_cw
         pose = np.eye(4, dtype=np.float64)
         pose[:3, :3] = R_wc
-        pose[:3, 3] = t_wc
+        pose[:3, 3] = t_wc * unit_scale
         pose_dict[img.name] = pose
     return pose_dict
 
@@ -208,6 +208,7 @@ def align_predictions(
     gt_ply: Path | str,
     output_dir: Path | str,
     voxel_size: float = 0.04,
+    unit_scale: float = 1.0,
     scale_trans: bool = True,
 ):
     estimated_root = Path(estimated_root)
@@ -219,7 +220,7 @@ def align_predictions(
     pred_entries, est_pose_np, cameras_dict = load_estimated_predictions(estimated_root)
     est_pose_names = [entry["name"] for entry in pred_entries]
 
-    gt_pose_map = load_gt_cam2world(gt_colmap_dir)
+    gt_pose_map = load_gt_cam2world(gt_colmap_dir, unit_scale)
 
 
     gt_pose_np = [gt_pose_map[name] for name in est_pose_names]
@@ -299,7 +300,7 @@ def align_predictions(
 
 
     gt_pcd_raw = o3d.io.read_point_cloud(str(gt_ply))
-    gt_points = np.asarray(gt_pcd_raw.points)
+    gt_points = np.asarray(gt_pcd_raw.points) * unit_scale
     gt_color = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     gt_pcd_colored = make_colored_point_cloud(gt_points, gt_color)
     gt_pcd_down = voxel_down_sample_safe(gt_pcd_colored, voxel_size)
