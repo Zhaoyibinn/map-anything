@@ -5,33 +5,73 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # Required imports
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import torch
 from mapanything.models import MapAnything
-from mapanything.utils.colmap import qvec2rotmat, read_images_text
+from mapanything.utils.colmap import (
+    qvec2rotmat,
+    read_cameras_binary,
+    read_cameras_text,
+    read_images_text,
+)
 from mapanything.utils.image import load_images
+from mapanything.utils.geometry import colmap_to_opencv_intrinsics
 import open3d as o3d
 
 from zyb_tools.align_estimated_to_gt import align_predictions
 import copy
 
+REPLICA_ROOT = Path("Replica")
+REPLICA_GT_ROOT = REPLICA_ROOT / "replica_gt"
+SCENE_NAME = "office0_sparse"
+input_camera = True
+input_pose = False
+input_depth = False
 
-SCAN_ID = 55
-SCAN_NAME = f"scan{int(SCAN_ID):02d}"
+input_tags: List[str] = []
+if input_camera:
+    input_tags.append("camera")
+if input_pose:
+    input_tags.append("pose")
+if input_depth:
+    input_tags.append("depth")
+input_suffix = "+".join(input_tags) if input_tags else "no_inputs"
 
-DTU_SET_ROOT = Path("DTU/set_23_24_33")
-DTU_SCAN_ROOT = DTU_SET_ROOT / SCAN_NAME
-IMAGES_DIR = DTU_SCAN_ROOT / "images"
-GT_COLMAP_DIR = DTU_SCAN_ROOT / "sparse" / "0"
-GT_DENSE_PLY = DTU_SCAN_ROOT / "dense" / "fused.ply"
-output_root = Path("output") / "DTU" / SCAN_NAME
+output_root = Path("output") / "Replica" / SCENE_NAME / input_suffix
 
 
-gt_images = read_images_text(str(GT_COLMAP_DIR / "images.txt"))
-gt_images_by_name = {img.name: img for img in gt_images.values()}
+
+SCENE_ROOT = REPLICA_GT_ROOT / f"{SCENE_NAME}"
+SPARSE_SUBDIR = Path(os.environ.get("REPLICA_SPARSE_SUBDIR", "sparse/0"))
+IMAGES_DIR = SCENE_ROOT / "images"
+DEPTH_DIR = SCENE_ROOT / "depth_images"
+GT_COLMAP_DIR = SCENE_ROOT / SPARSE_SUBDIR
+
+
+
+def resolve_gt_dense_ply(scene_root: Path) -> Optional[Path]:
+    env_path = os.environ.get("REPLICA_GT_PLY")
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.exists():
+            return candidate
+
+    candidates = [
+        scene_root / "gt_pcd_0.ply",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+GT_DENSE_PLY = resolve_gt_dense_ply(SCENE_ROOT)
+
 
 # Get inference device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -43,6 +83,7 @@ model = MapAnything.from_pretrained("facebook/map-anything").to(device)
 # COLMAP helpers ------------------------------------------------------------
 
 SUPPORTED_IMAGE_EXTENSIONS: Tuple[str, ...] = (".jpg", ".jpeg", ".png")
+SUPPORTED_DEPTH_EXTENSIONS: Tuple[str, ...] = (".png", ".tif", ".tiff", ".exr", ".npy", ".npz")
 
 
 def list_image_paths(images_source: str | Sequence[str]) -> List[Path]:
@@ -85,6 +126,89 @@ def rotation_matrix_to_qvec(R: np.ndarray) -> np.ndarray:
     return q
 
 
+def camera_to_intrinsics(camera) -> np.ndarray:
+    model = camera.model.upper()
+    params = camera.params
+
+    if model in {"PINHOLE", "OPENCV", "FULL_OPENCV", "RADIAL", "RADIAL_FISHEYE"}:
+        fx, fy, cx, cy = params[:4]
+    elif model in {"SIMPLE_PINHOLE", "SIMPLE_RADIAL", "SIMPLE_RADIAL_FISHEYE"}:
+        fx = fy = params[0]
+        cx, cy = params[1:3]
+    else:
+        raise ValueError(f"Unsupported COLMAP camera model '{camera.model}'")
+
+    K = np.array(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    return colmap_to_opencv_intrinsics(K)
+
+
+def build_depth_index(depth_dir: Path) -> Dict[str, Path]:
+    if not depth_dir.exists():
+        return {}
+
+    index: Dict[str, Path] = {}
+    for path in depth_dir.glob("**/*"):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in SUPPORTED_DEPTH_EXTENSIONS:
+            continue
+        stem = path.stem
+        index.setdefault(stem, path)
+        if stem.endswith("_depth"):
+            index.setdefault(stem[:-6], path)
+        if stem.endswith("Depth"):
+            index.setdefault(stem[:-5], path)
+        if stem.endswith("_d"):
+            index.setdefault(stem[:-2], path)
+    return index
+
+
+def find_depth_path(image_path: Path, depth_index: Dict[str, Path]) -> Optional[Path]:
+    stem = image_path.stem
+    candidates = [stem]
+    if stem.endswith("_rgb"):
+        candidates.append(stem[:-4])
+        candidates.append(f"{stem[:-4]}_depth")
+    candidates.append(f"{stem}_depth")
+    candidates.append(stem.replace("_rgb", "_depth"))
+
+    for candidate in candidates:
+        path = depth_index.get(candidate)
+        if path is not None:
+            return path
+    return None
+
+
+def load_depth_file(path: Path) -> np.ndarray:
+    suffix = path.suffix.lower()
+    if suffix in {".png", ".tiff", ".tif", ".exr"}:
+        depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    elif suffix == ".npy":
+        depth = np.load(path)
+    elif suffix == ".npz":
+        with np.load(path) as data:
+            if "depth" in data:
+                depth = data["depth"]
+            else:
+                depth = data[data.files[0]]
+    else:
+        raise ValueError(f"Unsupported depth file extension: {path.suffix}")
+
+    if depth is None:
+        raise ValueError(f"Failed to load depth file: {path}")
+
+    return depth
+
+
 def write_colmap_cameras(path: Path, entries: Sequence[dict]) -> None:
     header = (
         "# Camera list with one line of data per camera:\n"
@@ -123,18 +247,40 @@ def write_colmap_images(path: Path, entries: Sequence[dict]) -> None:
 
 
 # Load and preprocess images from a folder or list of paths
+if not IMAGES_DIR.exists():
+    raise FileNotFoundError(f"Replica images directory not found: {IMAGES_DIR}")
+
+if not GT_COLMAP_DIR.exists():
+    raise FileNotFoundError(f"Replica COLMAP sparse directory not found: {GT_COLMAP_DIR}")
+
+gt_images = read_images_text(str(GT_COLMAP_DIR / "images.txt"))
+gt_images_by_name = {img.name: img for img in gt_images.values()}
+
+cameras_txt = GT_COLMAP_DIR / "cameras.txt"
+cameras_bin = GT_COLMAP_DIR / "cameras.bin"
+if cameras_txt.exists():
+    gt_cameras = read_cameras_text(str(cameras_txt))
+elif cameras_bin.exists():
+    gt_cameras = read_cameras_binary(str(cameras_bin))
+else:
+    raise FileNotFoundError(
+        f"Neither cameras.txt nor cameras.bin found in {GT_COLMAP_DIR}"
+    )
+
+depth_index = build_depth_index(DEPTH_DIR)
+if not depth_index:
+    print(f"Warning: no depth files found under {DEPTH_DIR}")
+
 images = IMAGES_DIR
 image_paths = list_image_paths(images)
 views = load_images([str(p) for p in image_paths])
 
-# Manually specified camera intrinsics in the original image resolution (fx, fy, cx, cy)
-MANUAL_FX = 2892.3299999999999
-MANUAL_FY = 2883.1799999999998
-MANUAL_CX = 777.0
-MANUAL_CY = 581.0
-
 view_transforms: List[dict] = []
 original_shapes: List[Tuple[int, int]] = []
+gt_depths_resized: List[Optional[np.ndarray]] = []
+gt_depths_raw: List[Optional[np.ndarray]] = []
+gt_depth_paths: List[Optional[Path]] = []
+missing_depth_images: List[str] = []
 for idx, view in enumerate(views):
     resized_h, resized_w = map(int, np.squeeze(view["true_shape"]))
     original_shape = view.get("original_shape")
@@ -145,6 +291,21 @@ for idx, view in enumerate(views):
 
     original_shapes.append((orig_h, orig_w))
 
+    image_path = image_paths[idx] if idx < len(image_paths) else Path(f"view_{idx:03d}.png")
+    image_name = image_path.name
+
+    gt_image = gt_images_by_name.get(image_name)
+    if gt_image is None:
+        raise KeyError(f"No COLMAP entry found for image '{image_name}'")
+
+    gt_camera = gt_cameras.get(gt_image.camera_id)
+    if gt_camera is None:
+        raise KeyError(
+            f"No camera parameters for camera_id={gt_image.camera_id} (image '{image_name}')"
+        )
+
+    intrinsics_full = camera_to_intrinsics(gt_camera)
+
     # Mirror the uniform resize + center crop done in load_images for consistent intrinsics.
     if orig_w <= 0 or orig_h <= 0:
         scale = 1.0
@@ -153,26 +314,21 @@ for idx, view in enumerate(views):
 
     scale = float(scale) if scale > 0.0 else 1.0
 
-    scaled_w = max(resized_w, int(np.floor(orig_w * scale)))
-    scaled_h = max(resized_h, int(np.floor(orig_h * scale)))
+    scaled_w = max(resized_w, int(round(orig_w * scale)))
+    scaled_h = max(resized_h, int(round(orig_h * scale)))
     crop_left = max((scaled_w - resized_w) // 2, 0)
     crop_top = max((scaled_h - resized_h) // 2, 0)
 
-    fx_resized = MANUAL_FX * scale
-    fy_resized = MANUAL_FY * scale
-    cx_resized = MANUAL_CX * scale - crop_left
-    cy_resized = MANUAL_CY * scale - crop_top
+    intrinsics_resized = intrinsics_full.copy()
+    intrinsics_resized[0, 0] *= scale
+    intrinsics_resized[1, 1] *= scale
+    intrinsics_resized[0, 2] = intrinsics_resized[0, 2] * scale - crop_left
+    intrinsics_resized[1, 2] = intrinsics_resized[1, 2] * scale - crop_top
 
-    intrinsics = torch.tensor(
-        [
-            [fx_resized, 0.0, cx_resized],
-            [0.0, fy_resized, cy_resized],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=torch.float32,
-    ).unsqueeze(0)
-
-    view["intrinsics"] = intrinsics
+    if input_camera:
+        view["intrinsics"] = (
+            torch.from_numpy(intrinsics_resized.astype(np.float32)).unsqueeze(0)
+        )
 
     view_transforms.append(
         dict(
@@ -182,8 +338,48 @@ for idx, view in enumerate(views):
         )
     )
 
-    image_name = image_paths[idx].name if idx < len(image_paths) else f"view_{idx:03d}.png"
-    gt_image = gt_images_by_name.get(image_name)
+    depth_path = find_depth_path(image_path, depth_index) if depth_index else None
+    if depth_path is not None:
+        depth_raw = load_depth_file(depth_path)
+        depth_raw_float = depth_raw.astype(np.float32)
+
+        if (depth_raw.shape[1], depth_raw.shape[0]) != (scaled_w, scaled_h):
+            depth_scaled = cv2.resize(
+                depth_raw_float,
+                (scaled_w, scaled_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        else:
+            depth_scaled = depth_raw_float
+
+        depth_cropped = depth_scaled[
+            crop_top : crop_top + resized_h,
+            crop_left : crop_left + resized_w,
+        ]
+
+        if depth_cropped.shape != (resized_h, resized_w):
+            center_top = max((depth_scaled.shape[0] - resized_h) // 2, 0)
+            center_left = max((depth_scaled.shape[1] - resized_w) // 2, 0)
+            depth_cropped = depth_scaled[
+                center_top : center_top + resized_h,
+                center_left : center_left + resized_w,
+            ]
+
+        depth_cropped = np.ascontiguousarray(depth_cropped.astype(np.float32))
+        depth_tensor = torch.from_numpy(depth_cropped).unsqueeze(0)
+        if input_depth:
+            view["depth_z"] = depth_tensor / 6553.5
+            view["is_metric_scale"] = torch.tensor([True], dtype=torch.bool)
+        # view["gt_depth_resized"] = depth_tensor.unsqueeze(-1)
+        gt_depths_resized.append(depth_cropped.copy())
+        gt_depths_raw.append(np.ascontiguousarray(depth_raw))
+        gt_depth_paths.append(depth_path)
+    else:
+        missing_depth_images.append(image_name)
+        gt_depths_resized.append(None)
+        gt_depths_raw.append(None)
+        gt_depth_paths.append(None)
+
     gt_qvec = gt_image.qvec.astype(np.float64)
     gt_tvec = gt_image.tvec.astype(np.float64)
     gt_R_cw = qvec2rotmat(gt_qvec)
@@ -194,7 +390,15 @@ for idx, view in enumerate(views):
     gt_pose_cam2world[:3, :3] = gt_R_wc.astype(np.float32)
     gt_pose_cam2world[:3, 3] = gt_t_wc.astype(np.float32)
 
-    view["camera_poses"] = torch.from_numpy(gt_pose_cam2world[None, ...])
+    if input_pose:
+        view["camera_poses"] = torch.from_numpy(gt_pose_cam2world[None, ...])
+
+if missing_depth_images:
+    preview = ", ".join(missing_depth_images[:5])
+    print(
+        f"Warning: missing depth maps for {len(missing_depth_images)} images. "
+        f"Examples: {preview}"
+    )
 
 # Run inference
 predictions = model.infer(
@@ -234,8 +438,6 @@ all_points = []
 all_colors = []
 camera_entries: List[dict] = []
 image_entries: List[dict] = []
-gt_camera_entries: List[dict] = []
-gt_image_entries: List[dict] = []
 
 # Access results for each view - Complete list of metric outputs
 for i, pred in enumerate(predictions):
@@ -327,6 +529,42 @@ for i, pred in enumerate(predictions):
         cv2.imwrite(str(view_dir / "depth.tiff"), depth_mm)
         # 保存深度图
         # Also save as 16-bit TIFF
+
+        gt_depth_resized = (
+            gt_depths_resized[saved_view_idx]
+            if saved_view_idx < len(gt_depths_resized)
+            else None
+        )
+        if gt_depth_resized is not None:
+            np.save(view_dir / "gt_depth.npy", gt_depth_resized.astype(np.float32))
+
+            raw_depth = (
+                gt_depths_raw[saved_view_idx]
+                if saved_view_idx < len(gt_depths_raw)
+                else None
+            )
+            if raw_depth is not None:
+                np.save(view_dir / "gt_depth_raw.npy", raw_depth)
+                if raw_depth.dtype in (np.uint8, np.uint16, np.uint32):
+                    cv2.imwrite(str(view_dir / "gt_depth_raw.png"), raw_depth)
+
+            depth_src_path = (
+                gt_depth_paths[saved_view_idx]
+                if saved_view_idx < len(gt_depth_paths)
+                else None
+            )
+            if depth_src_path is not None:
+                (view_dir / "gt_depth_source.txt").write_text(
+                    str(depth_src_path), encoding="utf-8"
+                )
+
+            if gt_depth_resized.dtype in (np.float32, np.float64):
+                depth_mm_gt = np.clip(
+                    gt_depth_resized * DEPTH_SCALE_MM,
+                    0.0,
+                    float(np.iinfo(np.uint16).max),
+                ).astype(np.uint16)
+                cv2.imwrite(str(view_dir / "gt_depth_mm.png"), depth_mm_gt)
 
         intrinsics_rescaled = intrinsics_np[b].astype(np.float64).copy()
         # Undo the preprocessing crop/scale to express intrinsics in the original resolution.
@@ -425,55 +663,58 @@ print(f"Saved outputs for {saved_view_idx} views to '{ma_sparse_dir.resolve()}'"
 
 align_dir = output_root / "align"
 
-scale, rot, trans, aligned_pose_np, gt_pose_t, cameras_dict = align_predictions(
-    estimated_root=ma_sparse_dir,
-    gt_colmap_dir=str(GT_COLMAP_DIR),
-    gt_ply=str(GT_DENSE_PLY),
-    output_dir=align_dir,
-    voxel_size=0.04,
-)
+if GT_DENSE_PLY is not None and GT_DENSE_PLY.exists():
+    scale, rot, trans, aligned_pose_np, gt_pose_t, cameras_dict = align_predictions(
+        estimated_root=ma_sparse_dir,
+        gt_colmap_dir=str(GT_COLMAP_DIR),
+        gt_ply=str(GT_DENSE_PLY),
+        output_dir=align_dir,
+        voxel_size=0.04,
+        scale_trans = False
+    )
+    print(f"Alignment scale: {scale}")
 
-camera_entries_align = copy.deepcopy(camera_entries)
-image_entries_align = copy.deepcopy(image_entries)
+    camera_entries_align = copy.deepcopy(camera_entries)
+    image_entries_align = copy.deepcopy(image_entries)
 
+    for cam_entry, img_entry, aligned_pose in zip(
+        camera_entries_align, image_entries_align, aligned_pose_np
+    ):
+        cam_entry["pose_cam2world_aligned"] = aligned_pose
 
+        R_wc_aligned = aligned_pose[:3, :3]
+        t_wc_aligned = aligned_pose[:3, 3]
+        R_cw_aligned = R_wc_aligned.T
+        t_cw_aligned = -R_cw_aligned @ t_wc_aligned
+        qvec_aligned = rotation_matrix_to_qvec(R_cw_aligned)
 
-for cam_entry, img_entry, aligned_pose in zip(
-    camera_entries_align, image_entries_align, aligned_pose_np
-):
-    cam_entry["pose_cam2world_aligned"] = aligned_pose
+        img_entry["qvec"] = qvec_aligned.astype(np.float64)
+        img_entry["tvec"] = t_cw_aligned.astype(np.float64)
 
-    R_wc_aligned = aligned_pose[:3, :3]
-    t_wc_aligned = aligned_pose[:3, 3]
-    R_cw_aligned = R_wc_aligned.T
-    t_cw_aligned = -R_cw_aligned @ t_wc_aligned
-    qvec_aligned = rotation_matrix_to_qvec(R_cw_aligned)
+    write_colmap_cameras(align_sparse_dir / "cameras.txt", camera_entries_align)
+    write_colmap_images(align_sparse_dir / "images.txt", image_entries_align)
 
-    img_entry["qvec"] = qvec_aligned.astype(np.float64)
-    img_entry["tvec"] = t_cw_aligned.astype(np.float64)
+    camera_entries_gt = copy.deepcopy(camera_entries)
+    image_entries_gt = copy.deepcopy(image_entries)
 
-write_colmap_cameras(align_sparse_dir / "cameras.txt", camera_entries_align)
-write_colmap_images(align_sparse_dir / "images.txt", image_entries_align)
+    for cam_entry, img_entry, gt_pose in zip(
+        camera_entries_gt, image_entries_gt, np.array(gt_pose_t)
+    ):
+        cam_entry["pose_cam2world_aligned"] = gt_pose
 
+        R_wc_aligned = gt_pose[:3, :3]
+        t_wc_aligned = gt_pose[:3, 3]
+        R_cw_aligned = R_wc_aligned.T
+        t_cw_aligned = -R_cw_aligned @ t_wc_aligned
+        qvec_aligned = rotation_matrix_to_qvec(R_cw_aligned)
 
-camera_entries_gt = copy.deepcopy(camera_entries)
-image_entries_gt = copy.deepcopy(image_entries)
+        img_entry["qvec"] = qvec_aligned.astype(np.float64)
+        img_entry["tvec"] = t_cw_aligned.astype(np.float64)
 
-
-
-for cam_entry, img_entry, gt_pose in zip(
-    camera_entries_gt, image_entries_gt, np.array(gt_pose_t)
-):
-    cam_entry["pose_cam2world_aligned"] = gt_pose
-
-    R_wc_aligned = gt_pose[:3, :3]
-    t_wc_aligned = gt_pose[:3, 3]
-    R_cw_aligned = R_wc_aligned.T
-    t_cw_aligned = -R_cw_aligned @ t_wc_aligned
-    qvec_aligned = rotation_matrix_to_qvec(R_cw_aligned)
-
-    img_entry["qvec"] = qvec_aligned.astype(np.float64)
-    img_entry["tvec"] = t_cw_aligned.astype(np.float64)
-
-write_colmap_cameras(gt_sparse_dir / "cameras.txt", camera_entries_gt)
-write_colmap_images(gt_sparse_dir / "images.txt", image_entries_gt)
+    write_colmap_cameras(gt_sparse_dir / "cameras.txt", camera_entries_gt)
+    write_colmap_images(gt_sparse_dir / "images.txt", image_entries_gt)
+else:
+    print(
+        "Skipping alignment step: ground-truth point cloud not found. "
+        f"Checked path: {GT_DENSE_PLY}"
+    )

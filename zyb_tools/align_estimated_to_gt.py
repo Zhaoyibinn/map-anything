@@ -208,6 +208,7 @@ def align_predictions(
     gt_ply: Path | str,
     output_dir: Path | str,
     voxel_size: float = 0.04,
+    scale_trans: bool = True,
 ):
     estimated_root = Path(estimated_root)
     gt_colmap_dir = Path(gt_colmap_dir)
@@ -226,8 +227,10 @@ def align_predictions(
     est_pose_t, gt_pose_t = build_pose_tensors(est_pose_np, gt_pose_np)
     scale, rot, trans = align_multiple_poses(est_pose_t, gt_pose_t)
 
+    applied_scale = scale if scale_trans else 1.0
+
     aligned_pose_np = np.stack(
-        [apply_alignment_to_pose(pose, scale, rot, trans) for pose in est_pose_np],
+        [apply_alignment_to_pose(pose, applied_scale, rot, trans) for pose in est_pose_np],
         axis=0,
     )
 
@@ -266,6 +269,7 @@ def align_predictions(
 
     transform_info = {
         "scale": scale,
+        "scale_applied": applied_scale,
         "rotation": rot_np.tolist(),
         "translation": trans_np.tolist(),
         "view_to_image": {name: name for name in est_pose_names},
@@ -283,7 +287,7 @@ def align_predictions(
     est_points = np.asarray(est_pcd_orig.points)
 
 
-    aligned_points = apply_alignment_to_points(est_points, scale, rot, trans)
+    aligned_points = apply_alignment_to_points(est_points, applied_scale, rot, trans)
     # 变换点云 对齐
     pred_color = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     est_pcd_aligned = make_colored_point_cloud(aligned_points, pred_color)
