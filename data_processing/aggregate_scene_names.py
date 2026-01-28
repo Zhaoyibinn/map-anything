@@ -19,6 +19,7 @@ from natsort import natsorted
 from tqdm import tqdm
 
 from mapanything.datasets.utils.data_splits import (
+    AerialMegaDepthSplits,
     BlendedMVSSplits,
     DL3DV10KSplits,
     ETH3DSplits,
@@ -363,6 +364,24 @@ class MegaDepthAggregator(DatasetAggregator):
         super().aggregate(val_split_scenes=self.dataset_split_info.val_split_scenes)
 
 
+class AerialMegaDepthAggregator(DatasetAggregator):
+    """Aggregator for AerialMegaDepth dataset."""
+
+    def __init__(self, root_dir, output_dir, covisibility_version_key="v0"):
+        super().__init__(
+            dataset_name="aerialmegadepth",
+            root_dir=root_dir,
+            output_dir=output_dir,
+            covisibility_version_key=covisibility_version_key,
+            depth_folder="depth",
+        )
+        self.dataset_split_info = AerialMegaDepthSplits()
+
+    def aggregate(self):
+        """Aggregate the AerialMegaDepth dataset."""
+        super().aggregate(val_split_scenes=self.dataset_split_info.val_split_scenes)
+
+
 class MPSDAggregator(DatasetAggregator):
     """Aggregator for MPSD dataset."""
 
@@ -525,19 +544,19 @@ def main():
         "--wai_root",
         type=str,
         help="Path to the root of WAI format datasets",
-        default="/fsx/xrtech/data",
+        default="/ai4rl/fsx/xrtech/data",
     )
     parser.add_argument(
         "--raw_data_root",
         type=str,
         help="Path to the root of raw datasets from WAI is processed",
-        default="/fsx/xrtech/raw_data",
+        default="/ai4rl/fsx/xrtech/raw_data",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         help="Path to the output directory",
-        default="/fsx/nkeetha/mapanything_dataset_metadata",
+        default="/ai4rl/fsx/nkeetha/mapanything_dataset_metadata",
     )
     parser.add_argument(
         "--datasets",
@@ -551,6 +570,7 @@ def main():
             "dynamicreplica",
             "eth3d",
             "megadepth",
+            "aerialmegadepth",
             "mpsd",
             "mvs_synth",
             "paralleldomain4d",
@@ -567,6 +587,7 @@ def main():
             "dynamicreplica",
             "eth3d",
             "megadepth",
+            "aerialmegadepth",
             "mpsd",
             "mvs_synth",
             "paralleldomain4d",
@@ -634,6 +655,12 @@ def main():
         elif dataset == "megadepth":
             # MegaDepth
             aggregator = MegaDepthAggregator(
+                root_dir=root_dir, output_dir=args.output_dir
+            )
+            aggregator.aggregate()
+        elif dataset == "aerialmegadepth":
+            # AerialMegaDepth
+            aggregator = AerialMegaDepthAggregator(
                 root_dir=root_dir, output_dir=args.output_dir
             )
             aggregator.aggregate()
